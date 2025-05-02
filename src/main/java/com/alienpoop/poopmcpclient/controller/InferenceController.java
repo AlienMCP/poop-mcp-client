@@ -1,9 +1,10 @@
 package com.alienpoop.poopmcpclient.controller;
 
-import cn.hutool.core.util.StrUtil;
 import com.alienpoop.poopmcpclient.dto.AiMessageParams;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -11,14 +12,18 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.chat.prompt.PromptTemplate;
+import org.springframework.ai.chat.prompt.SystemPromptTemplate;
 import org.springframework.ai.document.Document;
-import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.ai.ollama.api.OllamaOptions;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.ai.vectorstore.filter.Filter.Expression;
+import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.codec.ServerSentEvent;
@@ -37,50 +42,76 @@ public class InferenceController {
 
   @Autowired private ObjectMapper objectMapper;
 
-  @Autowired private EmbeddingModel embeddingModel;
+  @Value("${hyperAGI.api}")
+  private String hyperAGIAPI;
 
-  private static final String PROMPT =
+  private static final String SYSTEM_PROMPT_TEMPLATE =
       """
-      Below is the system prompt:
-      {}
-      ---------------------
-      The following is additional knowledge from the knowledge base. If the knowledge base contains relevant content (non-empty and related to the query), prioritize it to generate the answer and do not call any functions:
-      {}
-      ---------------------
-      The following is the chat history between us:
-      {}
-      """;
+            You are an intelligent assistant. Use the following information to respond to the user's query:
+            - Contextual Information: {context}
+            - Chat History: {chatHistory}
+            - Custom Instructions: {customSystemPrompt}
+            If the query requires specific actions (e.g., querying product information, calculating prices), use the provided tools.
+            Otherwise, provide a concise and accurate response based on the provided information.
+            """;
+
+  private static final String USER_PROMPT =
+      """
+            {userText}
+            """;
 
   @PostMapping(value = "asyncChat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
   public Flux<ServerSentEvent<String>> asyncChat(@RequestBody AiMessageParams messageParams) {
     try {
-      String chatMemoryStr = "";
-      String knowledgeBaseStr = "";
 
-      if (messageParams.getEnableVectorStore()) {
-        knowledgeBaseStr =
-            getKnowledgeBase(messageParams.getAssistantId(), messageParams.getTextContent());
-        log.info("KnowledgeBase: {}", knowledgeBaseStr);
+      List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
+
+      if (messageParams.getOnlyTool()) {
+        String sessionId =
+            messageParams.getSessionId() != null ? messageParams.getSessionId() : "default_session";
+        String userId =
+            messageParams.getAssistantId() != null
+                ? messageParams.getAssistantId()
+                : "default_user";
+        String textContent =
+            messageParams.getTextContent() != null ? messageParams.getTextContent() : "";
+        String customSystemPrompt =
+            messageParams.getContent() != null ? messageParams.getContent() : "";
+
+        String userText = toPrompt(messageParams);
+
+        String chatHistory = "";
+
+        String vectorContext =
+            useVectorStore(messageParams.getEnableVectorStore(), userId, textContent);
+
+        SystemPromptTemplate systemPromptTemplate =
+            new SystemPromptTemplate(SYSTEM_PROMPT_TEMPLATE);
+        Map<String, Object> systemPromptParams = new HashMap<>();
+        systemPromptParams.put("context", vectorContext);
+        systemPromptParams.put("chatHistory", chatHistory);
+        systemPromptParams.put("customSystemPrompt", customSystemPrompt);
+        Prompt systemPrompt = systemPromptTemplate.create(systemPromptParams);
+
+        PromptTemplate userPromptTemplate = new PromptTemplate(USER_PROMPT);
+        Map<String, Object> userPromptParams = new HashMap<>();
+        userPromptParams.put("userText", userText);
+        Prompt userPrompt = userPromptTemplate.create(userPromptParams);
+
+        messages.add(systemPrompt.getInstructions().get(0));
+        messages.add(userPrompt.getInstructions().get(0));
       }
 
-      String content = messageParams.getContent() != null ? messageParams.getContent() : "";
-      String textContent =
-          messageParams.getTextContent() != null ? messageParams.getTextContent() : "";
-      String prompt = StrUtil.format(PROMPT, content, knowledgeBaseStr, chatMemoryStr, textContent);
-      log.info("Prompt: {}", prompt);
-      log.info(
-          "EnableVectorStore: {}, EnableAgent: {}",
-          messageParams.getEnableVectorStore(),
-          messageParams.getEnableAgent());
+      OllamaOptions chatOptions = OllamaOptions.builder().build();
 
-      return ChatClient.create(chatModel)
-          .prompt(prompt)
-          .tools(messageParams.getEnableAgent() ? toolCallbackProvider : null)
-          .stream()
+      chatOptions.setToolCallbacks(Arrays.asList(toolCallbackProvider.getToolCallbacks()));
+
+      Prompt prompt = new Prompt(messages, chatOptions);
+
+      return ChatClient.create(chatModel).prompt(prompt).stream()
           .chatResponse()
           .doOnNext(
               chatResponse -> {
-                // 记录 GenerationMetadata
                 if (chatResponse.getResult().getOutput().getMetadata() != null
                     && chatResponse.getResult().getMetadata() != null) {
                   log.info(
@@ -92,7 +123,6 @@ public class InferenceController {
           .flatMap(
               chatResponse -> {
                 try {
-                  // 获取 textContent
                   String responseContent =
                       chatResponse != null && chatResponse.getResult() != null
                           ? chatResponse.getResult().getOutput().getText()
@@ -105,13 +135,11 @@ public class InferenceController {
                             .build());
                   }
 
-                  // 逐字符流式输出 textContent 和 metadata
                   return Flux.fromStream(
                           responseContent.chars().mapToObj(ch -> String.valueOf((char) ch)))
                       .map(
                           charContent -> {
                             try {
-                              // 构建包含 content 和 metadata 的 JSON
                               Map<String, Object> response = new HashMap<>();
                               response.put("content", charContent);
                               response.put("metadata", chatResponse.getMetadata().getUsage());
@@ -144,36 +172,60 @@ public class InferenceController {
     }
   }
 
-  // 新增同步方法
   @PostMapping(value = "syncChat", produces = MediaType.APPLICATION_JSON_VALUE)
   public ResponseEntity<String> syncChat(@RequestBody AiMessageParams messageParams) {
     try {
-      String chatMemoryStr = "";
-      String knowledgeBaseStr = "";
 
-      if (messageParams.getEnableVectorStore()) {
-        knowledgeBaseStr =
-            getKnowledgeBase(messageParams.getAssistantId(), messageParams.getTextContent());
-        log.info("KnowledgeBase: {}", knowledgeBaseStr);
+      List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
+
+      if (messageParams.getOnlyTool()) {
+        String sessionId =
+            messageParams.getSessionId() != null ? messageParams.getSessionId() : "default_session";
+        String userId =
+            messageParams.getAssistantId() != null
+                ? messageParams.getAssistantId()
+                : "default_user";
+        String textContent =
+            messageParams.getTextContent() != null ? messageParams.getTextContent() : "";
+        String customSystemPrompt =
+            messageParams.getContent() != null ? messageParams.getContent() : "";
+
+        String userText = toPrompt(messageParams);
+
+        String chatHistory = "";
+
+        String vectorContext =
+            useVectorStore(messageParams.getEnableVectorStore(), userId, textContent);
+
+        SystemPromptTemplate systemPromptTemplate =
+            new SystemPromptTemplate(SYSTEM_PROMPT_TEMPLATE);
+        Map<String, Object> systemPromptParams = new HashMap<>();
+        systemPromptParams.put("context", vectorContext);
+        systemPromptParams.put("chatHistory", chatHistory);
+        systemPromptParams.put("customSystemPrompt", customSystemPrompt);
+        Prompt systemPrompt = systemPromptTemplate.create(systemPromptParams);
+
+        PromptTemplate userPromptTemplate = new PromptTemplate(USER_PROMPT);
+        Map<String, Object> userPromptParams = new HashMap<>();
+        userPromptParams.put("userText", userText);
+        Prompt userPrompt = userPromptTemplate.create(userPromptParams);
+
+        messages.add(systemPrompt.getInstructions().get(0));
+        messages.add(userPrompt.getInstructions().get(0));
       }
 
-      String content = messageParams.getContent() != null ? messageParams.getContent() : "";
-      String textContent =
-          messageParams.getTextContent() != null ? messageParams.getTextContent() : "";
-      String prompt = StrUtil.format(PROMPT, content, knowledgeBaseStr, chatMemoryStr, textContent);
-      log.info("Prompt: {}", prompt);
-      log.info(
-          "EnableVectorStore: {}, EnableAgent: {}",
-          messageParams.getEnableVectorStore(),
-          messageParams.getEnableAgent());
+      OllamaOptions chatOptions = OllamaOptions.builder().build();
 
-      // 同步调用 ChatClient
-      ChatResponse chatResponse =
-          ChatClient.create(chatModel)
-              .prompt(prompt)
-              .tools(messageParams.getEnableAgent() ? toolCallbackProvider : null)
-              .call()
-              .chatResponse();
+      chatOptions.setToolCallbacks(Arrays.asList(toolCallbackProvider.getToolCallbacks()));
+
+      Prompt prompt = new Prompt(messages, chatOptions);
+      log.info("Prompt Messages: {}", messages);
+      log.info("Enabled tools: {}", toolCallbackProvider.getToolCallbacks());
+      log.info("EnableVectorStore: {}", messageParams.getEnableVectorStore());
+      log.info("CustomSystemPrompt: {}", customSystemPrompt);
+
+      ChatClient chatClient = ChatClient.builder(chatModel).build();
+      ChatResponse chatResponse = chatClient.prompt(prompt).call().chatResponse();
 
       log.info("ChatResponse: {}", chatResponse);
       log.info(
@@ -182,7 +234,11 @@ public class InferenceController {
               ? chatResponse.getResult().getOutput().getText()
               : "null");
 
-      // 获取 textContent
+      if (chatResponse.getResult() != null
+          && chatResponse.getResult().getOutput().getToolCalls() != null) {
+        log.info("Tool Calls: {}", chatResponse.getResult().getOutput().getToolCalls());
+      }
+
       String responseContent =
           chatResponse != null && chatResponse.getResult() != null
               ? chatResponse.getResult().getOutput().getText()
@@ -191,8 +247,6 @@ public class InferenceController {
         log.warn("Empty chatResponse content");
         return ResponseEntity.ok("{\"error\": \"Empty response\"}");
       }
-
-      // 获取 Usage Metadata
       Object metadata =
           chatResponse.getMetadata() != null && chatResponse.getMetadata().getUsage() != null
               ? chatResponse.getMetadata().getUsage()
@@ -200,7 +254,6 @@ public class InferenceController {
       String metadataJson = objectMapper.writeValueAsString(metadata);
       log.info("Serialized Usage Metadata: {}", metadataJson);
 
-      // 构建响应 JSON
       Map<String, Object> response = new HashMap<>();
       response.put("content", responseContent);
       response.put("metadata", metadata);
@@ -214,36 +267,24 @@ public class InferenceController {
     }
   }
 
-  //  private String chatMemoryStrList(String sessionId) {
-  //
-  //    List<Map<String, Object>> list =
-  //        jdbcTemplate.queryForList(
-  //            "select * from ai_message where ai_session_id = ? order by created_time desc limit
-  // 30",
-  //            sessionId);
-  //
-  //    Collections.reverse(list);
-  //
-  //    List<String> chatMemoryStrList =
-  //        list.stream().map(i -> i.get("type") + ":" + i.get("text_content")).toList();
-  //
-  //    return StrUtil.join("\n", chatMemoryStrList);
-  //  }
+  public String toPrompt(AiMessageParams input) {
+    return input.getTextContent();
+  }
 
-  private String getKnowledgeBase(String assistantId, String textContent) {
+  public String useVectorStore(Boolean enableVectorStore, String assistantId, String userText) {
+    if (!enableVectorStore) return "";
 
     FilterExpressionBuilder b = new FilterExpressionBuilder();
-    Expression exp = b.in("assistantId", assistantId).build();
-
+    Filter.Expression exp = b.eq("assistantId", assistantId).build();
     log.info("filterExpression: {}", exp);
 
     SearchRequest searchRequest =
-        SearchRequest.builder().filterExpression(exp).query(textContent).build();
+        SearchRequest.builder().query(userText).filterExpression(exp).build();
 
     List<Document> documentList = vectorStore.similaritySearch(searchRequest);
+    List<String> texts = documentList.stream().map(Document::getText).toList();
+    log.info("useVectorStore: {}", String.join("\n", texts));
 
-    List<String> knowledgeBaseList = documentList.stream().map(Document::getText).toList();
-
-    return StrUtil.join("\n", knowledgeBaseList);
+    return String.join("\n", texts);
   }
 }

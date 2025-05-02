@@ -98,6 +98,14 @@
     </dependency>
 
 
+    <!-- https://mvnrepository.com/artifact/io.github.cdimascio/java-dotenv -->
+    <dependency>
+      <groupId>io.github.cdimascio</groupId>
+      <artifactId>java-dotenv</artifactId>
+      <version>5.2.2</version>
+    </dependency>
+
+
     <!--    <dependency>-->
     <!--      <groupId>org.springframework.ai</groupId>-->
     <!--      <artifactId>spring-ai-starter-model-openai</artifactId>-->
@@ -108,11 +116,30 @@
       <groupId>org.springframework.ai</groupId>
       <artifactId>spring-ai-starter-model-ollama</artifactId>
     </dependency>
-
-
   </dependencies>
-
-
+  <profiles>
+    <profile>
+      <id>dev</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+      </activation>
+      <properties>
+        <profile.name>dev</profile.name>
+      </properties>
+    </profile>
+    <profile>
+      <id>test</id>
+      <properties>
+        <profile.name>test</profile.name>
+      </properties>
+    </profile>
+    <profile>
+      <id>prod</id>
+      <properties>
+        <profile.name>prod</profile.name>
+      </properties>
+    </profile>
+  </profiles>
   <build>
     <plugins>
       <plugin>

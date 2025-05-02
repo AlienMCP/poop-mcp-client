@@ -1,33 +1,5 @@
 spring:
-  neo4j:
-    uri: bolt://127.0.0.1:7687
-  ai:
-    vectorstore:
-      neo4j:
-        initialize-schema: true
-        database-name: neo4j
-        index-name: custom-index
-        dimensions: 1024
-        distance-type: cosine
-    ollama:
-      # 填写模型所在的地址
-      base-url: http://43.156.65.246:11434
-      chat:
-        model: MFDoom/deepseek-r1-tool-calling:32b
-      embedding:
-        model: mxbai-embed-large  # 指定
-    mcp:
-      client:
-        enabled: true
-        name: poop-mcp-client
-        version: 1.0.0
-        request-timeout: 30s
-        type: SYNC  # or ASYNC for reactive applications
-        toolcallback:
-          enabled: true
-        sse:
-          connections:
-            server1:
-              url: http://localhost:8888
+  profiles:
+    active: '@profile.name@'
 server:
   port: 8881

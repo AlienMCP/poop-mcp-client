@@ -6,7 +6,7 @@ import lombok.Data;
 public class AiMessageParams {
 
   private Boolean enableVectorStore = false;
-  private Boolean enableAgent = false;
+  private Boolean onlyTool = false;
   private String userId;
   private String content;
   private String textContent;
