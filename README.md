@@ -1,6 +1,6 @@
-# Sputnik MCP Client
+# Poop MCP Client
 
-Sputnik MCP Client is a Spring Boot application that serves as a client for the Model Control Plane (MCP). It provides a RESTful API for AI inference and knowledge base management, leveraging Spring AI and Ollama for language model integration.
+Poop MCP Client is a Spring Boot application that serves as a client for the Model Control Plane (MCP). It provides a RESTful API for AI inference and knowledge base management, leveraging Spring AI and Ollama for language model integration.
 
 ## Features
 
