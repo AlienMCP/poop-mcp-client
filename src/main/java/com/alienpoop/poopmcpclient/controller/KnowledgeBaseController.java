@@ -1,6 +1,8 @@
 package com.alienpoop.poopmcpclient.controller;
 
 import cn.hutool.core.util.StrUtil;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -29,25 +31,19 @@ public class KnowledgeBaseController {
   @Data
   public static class UploadRequest {
     private String assistantId;
-    private String fileURL;
+    private List<String> fileURLs;
   }
 
-  // 请求体：查询文档
   @Data
   public static class QueryRequest {
     private String query;
     private String assistantId;
-    private int topK = 5; // 默认返回前 5 个结果
+    private int topK = 5;
   }
 
-  /** 上传文档到知识库 */
   @PostMapping("/upload")
   public ResponseEntity<Map<String, Object>> uploadDocument(@RequestBody UploadRequest request) {
     try {
-      if (StrUtil.isBlank(request.getFileURL()) || StrUtil.isBlank(request.getAssistantId())) {
-        return ResponseEntity.badRequest()
-            .body(Map.of("error", "Content and assistantId are required"));
-      }
 
       FilterExpressionBuilder b = new FilterExpressionBuilder();
 
@@ -62,21 +58,36 @@ public class KnowledgeBaseController {
 
       List<String> deleteIds = documentList.stream().map(Document::getId).toList();
 
-      // 先删除该用户之前的内容
       vectorStore.delete(deleteIds);
 
-      TikaDocumentReader tikaDocumentReader = new TikaDocumentReader(request.getFileURL());
+      List<Document> allSplitDocuments = new ArrayList<>();
 
-      // 将文本内容划分成更小的块
-      List<Document> splitDocuments =
-          new TokenTextSplitter(200, 200, 5, 10000, true).apply(tikaDocumentReader.read());
+      // Get the collection of file URLs
+      Collection<String> fileURLs = request.getFileURLs();
+      if (fileURLs != null && !fileURLs.isEmpty()) {
+        for (String fileURL : fileURLs) {
+          // Create a TikaDocumentReader for the current file URL
+          TikaDocumentReader tikaDocumentReader = new TikaDocumentReader(fileURL);
 
-      // 为每个文档添加用户ID
-      for (Document doc : splitDocuments) {
+          // Read and split satisfacer document
+          List<Document> splitDocuments =
+              new TokenTextSplitter(200, 200, 5, 10000, true).apply(tikaDocumentReader.read());
+
+          // Add metadata to each split document
+          for (Document doc : splitDocuments) {
+            doc.getMetadata().put("assistantId", request.getAssistantId());
+          }
+
+          // Add split documents to the overall list
+          allSplitDocuments.addAll(splitDocuments);
+        }
+      }
+
+      for (Document doc : allSplitDocuments) {
         doc.getMetadata().put("assistantId", request.getAssistantId());
       }
 
-      vectorStore.add(splitDocuments);
+      vectorStore.add(allSplitDocuments);
 
       log.info("Uploaded document for assistantId: {}", request.getAssistantId());
 
@@ -89,7 +100,6 @@ public class KnowledgeBaseController {
     }
   }
 
-  /** 删除知识库中的文档 */
   @PostMapping("/delete")
   public ResponseEntity<Map<String, Object>> deleteDocument(@RequestParam String assistantId) {
     try {
@@ -116,27 +126,24 @@ public class KnowledgeBaseController {
     }
   }
 
-  /** 查询知识库 */
   @PostMapping("/query")
   public ResponseEntity<Map<String, Object>> queryDocuments(
       @RequestBody KnowledgeBaseController.QueryRequest request) {
     try {
 
-      // 构建搜索请求
       SearchRequest.Builder builder = SearchRequest.builder().topK(request.getTopK());
 
-      // 处理查询字符串
       if (StrUtil.isNotBlank(request.getQuery())) {
-        // query 不为空，追加检索
+
         builder.query(request.getQuery());
         log.info(
             "Executing query search: {} with assistantId: {}",
             request.getQuery(),
             request.getAssistantId());
       } else {
-        // query 为空，基于 assistantId 检索（如果有）或返回空结果
+
         if (StrUtil.isNotBlank(request.getAssistantId())) {
-          builder.query(""); // 空查询，仅使用过滤条件
+          builder.query("");
           log.info(
               "Executing assistantId-based search for assistantId: {}", request.getAssistantId());
         } else {
@@ -154,7 +161,6 @@ public class KnowledgeBaseController {
 
       SearchRequest searchRequest = builder.build();
 
-      // 执行搜索
       List<Document> documents = vectorStore.similaritySearch(searchRequest);
       log.info(
           "Found {} documents for query: {} and assistantId: {}",
@@ -162,7 +168,6 @@ public class KnowledgeBaseController {
           request.getQuery(),
           request.getAssistantId());
 
-      // 格式化响应
       List<Map<String, Object>> results =
           documents.stream()
               .map(

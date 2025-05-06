@@ -69,7 +69,7 @@ public class InferenceController {
 
       List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
 
-      if (!messageParams.getOnlyTool()) {
+      if (Boolean.FALSE.equals(messageParams.getOnlyTool())) {
         String sessionId =
             messageParams.getSessionId() != null ? messageParams.getSessionId() : "default_session";
         String userId =
@@ -159,6 +159,7 @@ public class InferenceController {
                           .build());
                 }
               })
+          .concatWith(Flux.just(ServerSentEvent.builder("[DONE]").event("message").build()))
           .doOnError(e -> log.error("ChatClient error: {}", e.getMessage(), e))
           .doOnComplete(() -> log.info("ChatResponse stream completed"));
     } catch (Exception e) {
