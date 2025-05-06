@@ -1,10 +1,14 @@
 package com.alienpoop.poopmcpclient.controller;
 
+import cn.hutool.http.HttpRequest;
+import cn.hutool.json.JSONArray;
+import cn.hutool.json.JSONObject;
 import com.alienpoop.poopmcpclient.dto.AiMessageParams;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -13,7 +17,6 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
-import org.springframework.ai.chat.prompt.PromptTemplate;
 import org.springframework.ai.chat.prompt.SystemPromptTemplate;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.ollama.api.OllamaOptions;
@@ -47,16 +50,16 @@ public class InferenceController {
 
   private static final String SYSTEM_PROMPT_TEMPLATE =
       """
-            You are an intelligent assistant. Use the following information to respond to the user's query:
-            - Contextual Information: {context}
-            - Chat History: {chatHistory}
-            - Custom Instructions: {customSystemPrompt}
-            If the query requires specific actions (e.g., querying product information, calculating prices), use the provided tools.
-            Otherwise, provide a concise and accurate response based on the provided information.
-            """;
-
-  private static final String USER_PROMPT =
-      """
+            Below is the system prompt
+            {customSystemPrompt}
+            You are an intelligent assistant. If the user's query matches information in the provided knowledge base, you must respond strictly and exclusively using the information from the knowledge base, without additional reasoning, improvisation, or external information. For other queries requiring specific actions (e.g., querying product information, calculating prices), use the provided tools. Otherwise, provide a concise and accurate response based on the provided information.
+            ---------------------
+            The following content is the knowledge base. If the user's question is addressed here, your response must be derived solely from this content.
+            {context}
+            ---------------------
+            The following is the chat history. Use it only for contextual understanding when the knowledge base does not address the query, and do not let it influence the response if the knowledge base is applicable.
+            {chatHistory}
+            ---------------------
             {userText}
             """;
 
@@ -66,7 +69,7 @@ public class InferenceController {
 
       List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
 
-      if (messageParams.getOnlyTool()) {
+      if (!messageParams.getOnlyTool()) {
         String sessionId =
             messageParams.getSessionId() != null ? messageParams.getSessionId() : "default_session";
         String userId =
@@ -80,7 +83,7 @@ public class InferenceController {
 
         String userText = toPrompt(messageParams);
 
-        String chatHistory = "";
+        String chatHistory = useChatHistory(sessionId, 30);
 
         String vectorContext =
             useVectorStore(messageParams.getEnableVectorStore(), userId, textContent);
@@ -91,15 +94,10 @@ public class InferenceController {
         systemPromptParams.put("context", vectorContext);
         systemPromptParams.put("chatHistory", chatHistory);
         systemPromptParams.put("customSystemPrompt", customSystemPrompt);
+        systemPromptParams.put("userText", userText);
         Prompt systemPrompt = systemPromptTemplate.create(systemPromptParams);
 
-        PromptTemplate userPromptTemplate = new PromptTemplate(USER_PROMPT);
-        Map<String, Object> userPromptParams = new HashMap<>();
-        userPromptParams.put("userText", userText);
-        Prompt userPrompt = userPromptTemplate.create(userPromptParams);
-
         messages.add(systemPrompt.getInstructions().get(0));
-        messages.add(userPrompt.getInstructions().get(0));
       }
 
       OllamaOptions chatOptions = OllamaOptions.builder().build();
@@ -178,7 +176,7 @@ public class InferenceController {
 
       List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
 
-      if (messageParams.getOnlyTool()) {
+      if (!messageParams.getOnlyTool()) {
         String sessionId =
             messageParams.getSessionId() != null ? messageParams.getSessionId() : "default_session";
         String userId =
@@ -192,7 +190,7 @@ public class InferenceController {
 
         String userText = toPrompt(messageParams);
 
-        String chatHistory = "";
+        String chatHistory = useChatHistory(sessionId, 30);
 
         String vectorContext =
             useVectorStore(messageParams.getEnableVectorStore(), userId, textContent);
@@ -203,15 +201,10 @@ public class InferenceController {
         systemPromptParams.put("context", vectorContext);
         systemPromptParams.put("chatHistory", chatHistory);
         systemPromptParams.put("customSystemPrompt", customSystemPrompt);
+        systemPromptParams.put("userText", userText);
         Prompt systemPrompt = systemPromptTemplate.create(systemPromptParams);
 
-        PromptTemplate userPromptTemplate = new PromptTemplate(USER_PROMPT);
-        Map<String, Object> userPromptParams = new HashMap<>();
-        userPromptParams.put("userText", userText);
-        Prompt userPrompt = userPromptTemplate.create(userPromptParams);
-
         messages.add(systemPrompt.getInstructions().get(0));
-        messages.add(userPrompt.getInstructions().get(0));
       }
 
       OllamaOptions chatOptions = OllamaOptions.builder().build();
@@ -219,10 +212,8 @@ public class InferenceController {
       chatOptions.setToolCallbacks(Arrays.asList(toolCallbackProvider.getToolCallbacks()));
 
       Prompt prompt = new Prompt(messages, chatOptions);
-      log.info("Prompt Messages: {}", messages);
-      log.info("Enabled tools: {}", toolCallbackProvider.getToolCallbacks());
-      log.info("EnableVectorStore: {}", messageParams.getEnableVectorStore());
-      log.info("CustomSystemPrompt: {}", customSystemPrompt);
+
+      log.info("prompt.getContents():{}", prompt.getContents());
 
       ChatClient chatClient = ChatClient.builder(chatModel).build();
       ChatResponse chatResponse = chatClient.prompt(prompt).call().chatResponse();
@@ -286,5 +277,36 @@ public class InferenceController {
     log.info("useVectorStore: {}", String.join("\n", texts));
 
     return String.join("\n", texts);
+  }
+
+  public String useChatHistory(String sessionId, Integer pageSize) {
+
+    String body =
+        HttpRequest.get(hyperAGIAPI + "/mgn/aiMessage/list")
+            .form("pageNo", "1")
+            .form("pageSize", pageSize.toString())
+            .form("aiSessionId", sessionId)
+            .form("column", "created_time")
+            .timeout(10000)
+            .execute()
+            .body();
+
+    JSONObject result = new JSONObject(body);
+
+    JSONArray records = result.getJSONObject("result").getJSONArray("records");
+
+    Collections.reverse(records);
+
+    List<String> chatMemoryList =
+        records.stream()
+            .map(
+                record -> {
+                  JSONObject i = (JSONObject) record;
+
+                  return i.getStr("type") + ":" + i.getStr("textContent");
+                })
+            .toList();
+
+    return String.join("\n", chatMemoryList);
   }
 }
