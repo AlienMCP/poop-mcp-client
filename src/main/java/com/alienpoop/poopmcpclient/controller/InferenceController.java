@@ -12,6 +12,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.IntStream;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
@@ -106,6 +107,8 @@ public class InferenceController {
 
       Prompt prompt = new Prompt(messages, chatOptions);
 
+      log.info("Prompt: {}", prompt.getContents());
+
       return ChatClient.create(chatModel).prompt(prompt).stream()
           .chatResponse()
           .doOnNext(
@@ -177,7 +180,7 @@ public class InferenceController {
 
       List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
 
-      if (!messageParams.getOnlyTool()) {
+      if (Boolean.FALSE.equals(messageParams.getOnlyTool())) {
         String sessionId =
             messageParams.getSessionId() != null ? messageParams.getSessionId() : "default_session";
         String userId =
@@ -206,6 +209,9 @@ public class InferenceController {
         Prompt systemPrompt = systemPromptTemplate.create(systemPromptParams);
 
         messages.add(systemPrompt.getInstructions().get(0));
+      } else {
+        String userText = toPrompt(messageParams);
+        messages.add(new org.springframework.ai.chat.messages.UserMessage(userText));
       }
 
       OllamaOptions chatOptions = OllamaOptions.builder().build();
@@ -214,7 +220,7 @@ public class InferenceController {
 
       Prompt prompt = new Prompt(messages, chatOptions);
 
-      log.info("prompt.getContents():{}", prompt.getContents());
+      log.info("Prompt: {}", prompt.getContents());
 
       ChatClient chatClient = ChatClient.builder(chatModel).build();
       ChatResponse chatResponse = chatClient.prompt(prompt).call().chatResponse();
@@ -308,6 +314,16 @@ public class InferenceController {
                 })
             .toList();
 
-    return String.join("\n", chatMemoryList);
+    List<String> swappedChatMemoryList =
+        IntStream.range(0, chatMemoryList.size() / 2)
+            .mapToObj(
+                i -> {
+                  int index = i * 2;
+                  return Arrays.asList(chatMemoryList.get(index + 1), chatMemoryList.get(index));
+                })
+            .flatMap(List::stream)
+            .toList();
+
+    return String.join("\n", swappedChatMemoryList);
   }
 }
