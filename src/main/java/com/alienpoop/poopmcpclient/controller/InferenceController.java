@@ -4,6 +4,7 @@ import cn.hutool.http.HttpRequest;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import com.alienpoop.poopmcpclient.dto.AiMessageParams;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -99,11 +100,16 @@ public class InferenceController {
         Prompt systemPrompt = systemPromptTemplate.create(systemPromptParams);
 
         messages.add(systemPrompt.getInstructions().get(0));
+      } else {
+        String userText = toPrompt(messageParams);
+        messages.add(new org.springframework.ai.chat.messages.UserMessage(userText));
       }
 
       OllamaOptions chatOptions = OllamaOptions.builder().build();
 
-      chatOptions.setToolCallbacks(Arrays.asList(toolCallbackProvider.getToolCallbacks()));
+      if (messageParams.getEnableTool() || messageParams.getOnlyTool()) {
+        chatOptions.setToolCallbacks(Arrays.asList(toolCallbackProvider.getToolCallbacks()));
+      }
 
       Prompt prompt = new Prompt(messages, chatOptions);
 
@@ -111,60 +117,99 @@ public class InferenceController {
 
       return ChatClient.create(chatModel).prompt(prompt).stream()
           .chatResponse()
-          .doOnNext(
-              chatResponse -> {
-                if (chatResponse.getResult().getOutput().getMetadata() != null
-                    && chatResponse.getResult().getMetadata() != null) {
-                  log.info(
-                      "GenerationMetadata: {}", chatResponse.getResult().getOutput().getMetadata());
-                } else {
-                  log.warn("No GenerationMetadata available");
-                }
-              })
-          .flatMap(
-              chatResponse -> {
-                try {
-                  String responseContent =
-                      chatResponse != null && chatResponse.getResult() != null
-                          ? chatResponse.getResult().getOutput().getText()
-                          : "";
-                  if (responseContent.isEmpty()) {
-                    log.warn("Empty chatResponse content");
-                    return Flux.just(
-                        ServerSentEvent.builder("{\"error\": \"Empty response\"}")
-                            .event("message")
-                            .build());
-                  }
+          .doOnNext(chatResponse -> {
+            log.info("Received ChatResponse: {}", chatResponse);
+            String content = chatResponse != null
+                && chatResponse.getResult() != null
+                && chatResponse.getResult().getOutput() != null
+                ? chatResponse.getResult().getOutput().getText()
+                : "";
+          })
+          .collectList()
+          .flatMapMany(chatResponses -> {
+            try {
 
-                  return Flux.fromStream(
-                          responseContent.chars().mapToObj(ch -> String.valueOf((char) ch)))
-                      .map(
-                          charContent -> {
-                            try {
-                              Map<String, Object> response = new HashMap<>();
-                              response.put("content", charContent);
-                              response.put("metadata", chatResponse.getMetadata().getUsage());
-                              String json = objectMapper.writeValueAsString(response);
-                              return ServerSentEvent.builder(json).event("message").build();
-                            } catch (Exception e) {
-                              log.error("JSON serialization error for char: {}", e.getMessage(), e);
-                              return ServerSentEvent.builder("{\"error\": \"Serialization error\"}")
-                                  .event("message")
-                                  .build();
-                            }
-                          })
-                      .delayElements(Duration.ofMillis(50));
-                } catch (Exception e) {
-                  log.error("Processing error: {}", e.getMessage(), e);
-                  return Flux.just(
-                      ServerSentEvent.builder("{\"error\": \"Processing error\"}")
-                          .event("message")
-                          .build());
+              StringBuilder fullContent = new StringBuilder();
+              for (ChatResponse chatResponse : chatResponses) {
+                String content = chatResponse != null
+                    && chatResponse.getResult() != null
+                    && chatResponse.getResult().getOutput() != null
+                    ? chatResponse.getResult().getOutput().getText()
+                    : "";
+                if (!fullContent.toString().endsWith(content)) {
+                  fullContent.append(content);
                 }
-              })
-          .concatWith(Flux.just(ServerSentEvent.builder("[DONE]").event("message").build()))
+              }
+              String finalContent = fullContent.toString();
+              log.info("Final Content: {}", finalContent);
+
+              if (finalContent.isEmpty()) {
+                return Flux.just(
+                    ServerSentEvent.builder("{\"error\": \"No content received\"}")
+                        .event("error")
+                        .build());
+              }
+
+              Flux<ServerSentEvent<String>> contentFlux = Flux.fromStream(
+                      finalContent.chars().mapToObj(ch -> String.valueOf((char) ch)))
+                  .map(charContent -> {
+                    try {
+                      Map<String, Object> response = new HashMap<>();
+                      response.put("content", charContent);
+                      String json = objectMapper.writeValueAsString(response);
+                      log.debug("Sending content event: {}", json);
+                      return ServerSentEvent.builder(json).event("message").build();
+                    } catch (JsonProcessingException e) {
+                      log.error("JSON serialization error: {}", e.getMessage(), e);
+                      return ServerSentEvent.builder("{\"error\": \"Serialization error\"}")
+                          .event("error")
+                          .build();
+                    }
+                  })
+                  .delayElements(Duration.ofMillis(50));
+
+              ChatResponse lastResponse = chatResponses.isEmpty() ? null : chatResponses.get(chatResponses.size() - 1);
+              Object metadata = null;
+              try {
+                metadata = lastResponse != null && lastResponse.getMetadata() != null
+                    ? lastResponse.getMetadata().getUsage()
+                    : null;
+              } catch (Exception e) {
+                log.error("Error accessing metadata: {}", e.getMessage(), e);
+              }
+
+              Flux<ServerSentEvent<String>> metadataFlux = Flux.just(metadata)
+                  .map(meta -> {
+                    try {
+                      Map<String, Object> metadataResponse = new HashMap<>();
+                      if (meta != null) {
+                        metadataResponse.put("metadata", meta);
+                      } else {
+                        metadataResponse.put("metadata", "No metadata available");
+                      }
+                      String json = objectMapper.writeValueAsString(metadataResponse);
+                      log.debug("Sending metadata event: {}", json);
+                      return ServerSentEvent.builder(json).event("metadata").build();
+                    } catch (JsonProcessingException e) {
+                      log.error("JSON serialization error for metadata: {}", e.getMessage(), e);
+                      return ServerSentEvent.builder("{\"error\": \"Metadata serialization error\"}")
+                          .event("error")
+                          .build();
+                    }
+                  });
+
+              return contentFlux.concatWith(metadataFlux);
+            } catch (Exception e) {
+              log.error("Processing error: {}", e.getMessage(), e);
+              return Flux.just(
+                  ServerSentEvent.builder("{\"error\": \"Processing error: " + e.getMessage() + "\"}")
+                      .event("error")
+                      .build());
+            }
+          })
           .doOnError(e -> log.error("ChatClient error: {}", e.getMessage(), e))
           .doOnComplete(() -> log.info("ChatResponse stream completed"));
+
     } catch (Exception e) {
       log.error("AsyncChat error: {}", e.getMessage(), e);
       return Flux.just(
@@ -216,7 +261,9 @@ public class InferenceController {
 
       OllamaOptions chatOptions = OllamaOptions.builder().build();
 
-      chatOptions.setToolCallbacks(Arrays.asList(toolCallbackProvider.getToolCallbacks()));
+      if (messageParams.getEnableTool() || messageParams.getOnlyTool()) {
+        chatOptions.setToolCallbacks(Arrays.asList(toolCallbackProvider.getToolCallbacks()));
+      }
 
       Prompt prompt = new Prompt(messages, chatOptions);
 

@@ -12,4 +12,5 @@ public class AiMessageParams {
   private String textContent;
   private String sessionId;
   private String assistantId;
+  private Boolean enableTool = false;
 }
