@@ -34,3 +34,9 @@ server:
   port: 8881
 hyperAGI:
   api: ${HYPER_AGI_API}
+logging:
+  level:
+    org:
+      springframework:
+        ai:
+          vectorstore: DEBUG

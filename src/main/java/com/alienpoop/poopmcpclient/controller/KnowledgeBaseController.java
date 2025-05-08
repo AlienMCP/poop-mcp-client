@@ -2,7 +2,6 @@ package com.alienpoop.poopmcpclient.controller;
 
 import cn.hutool.core.util.StrUtil;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -31,7 +30,7 @@ public class KnowledgeBaseController {
   @Data
   public static class UploadRequest {
     private String assistantId;
-    private List<String> fileURLs;
+    private String fileURL;
   }
 
   @Data
@@ -44,6 +43,8 @@ public class KnowledgeBaseController {
   @PostMapping("/upload")
   public ResponseEntity<Map<String, Object>> uploadDocument(@RequestBody UploadRequest request) {
     try {
+
+      log.info("request:{}", request);
 
       FilterExpressionBuilder b = new FilterExpressionBuilder();
 
@@ -63,33 +64,34 @@ public class KnowledgeBaseController {
       List<Document> allSplitDocuments = new ArrayList<>();
 
       // Get the collection of file URLs
-      Collection<String> fileURLs = request.getFileURLs();
-      if (fileURLs != null && !fileURLs.isEmpty()) {
-        for (String fileURL : fileURLs) {
-          // Create a TikaDocumentReader for the current file URL
-          TikaDocumentReader tikaDocumentReader = new TikaDocumentReader(fileURL);
+      String[] fileURLs = request.getFileURL().split(",");
+      for (String fileURL : fileURLs) {
+        // Create a TikaDocumentReader for the current file URL
+        TikaDocumentReader tikaDocumentReader = new TikaDocumentReader(fileURL);
 
-          // Read and split satisfacer document
-          List<Document> splitDocuments =
-              new TokenTextSplitter(200, 200, 5, 10000, true).apply(tikaDocumentReader.read());
+        // Read and split satisfacer document
+        List<Document> splitDocuments =
+            new TokenTextSplitter(200, 200, 5, 10000, true).apply(tikaDocumentReader.read());
 
-          // Add metadata to each split document
-          for (Document doc : splitDocuments) {
-            doc.getMetadata().put("assistantId", request.getAssistantId());
-          }
-
-          // Add split documents to the overall list
-          allSplitDocuments.addAll(splitDocuments);
-        }
+        // Add split documents to the overall list
+        allSplitDocuments.addAll(splitDocuments);
       }
 
       for (Document doc : allSplitDocuments) {
         doc.getMetadata().put("assistantId", request.getAssistantId());
       }
 
+      log.info(
+          "allSplitDocuments: {}",
+          StrUtil.join(
+              "\n",
+              allSplitDocuments.stream().map(Document::getText).collect(Collectors.toList())));
+
       vectorStore.add(allSplitDocuments);
 
       log.info("Uploaded document for assistantId: {}", request.getAssistantId());
+
+      log.info("allSplitDocuments: {}", allSplitDocuments.size());
 
       return ResponseEntity.ok(
           Map.of("status", "success", "assistantId", request.getAssistantId()));
@@ -117,6 +119,8 @@ public class KnowledgeBaseController {
 
       List<String> deleteIds = documentList.stream().map(Document::getId).toList();
 
+      vectorStore.delete(deleteIds);
+
       return ResponseEntity.ok(
           Map.of("status", "success", "message", "Documents deleted successfully"));
     } catch (Exception e) {
@@ -143,7 +147,7 @@ public class KnowledgeBaseController {
       } else {
 
         if (StrUtil.isNotBlank(request.getAssistantId())) {
-          builder.query("");
+
           log.info(
               "Executing assistantId-based search for assistantId: {}", request.getAssistantId());
         } else {
@@ -161,7 +165,10 @@ public class KnowledgeBaseController {
 
       SearchRequest searchRequest = builder.build();
 
+      log.info("searchRequest: {}", searchRequest);
+
       List<Document> documents = vectorStore.similaritySearch(searchRequest);
+
       log.info(
           "Found {} documents for query: {} and assistantId: {}",
           documents.size(),
