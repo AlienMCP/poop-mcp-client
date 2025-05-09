@@ -66,6 +66,11 @@ public class KnowledgeBaseController {
       // Get the collection of file URLs
       String[] fileURLs = request.getFileURL().split(",");
       for (String fileURL : fileURLs) {
+
+        if (StrUtil.isBlank(fileURL)) {
+          continue;
+        }
+
         // Create a TikaDocumentReader for the current file URL
         TikaDocumentReader tikaDocumentReader = new TikaDocumentReader(fileURL);
 

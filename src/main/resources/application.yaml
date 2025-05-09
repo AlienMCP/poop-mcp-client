@@ -12,7 +12,7 @@ spring:
     ollama:
       base-url: ${OLLAMA_BASE_URL}
       chat:
-        model: MFDoom/deepseek-r1-tool-calling:32b
+        model: ${MODEL_NAME}
       embedding:
         model: mxbai-embed-large
     mcp:
