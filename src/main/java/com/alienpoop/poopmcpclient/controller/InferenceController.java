@@ -1,18 +1,24 @@
 package com.alienpoop.poopmcpclient.controller;
 
+import cn.hutool.core.date.StopWatch;
 import cn.hutool.http.HttpRequest;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import com.alienpoop.poopmcpclient.dto.AiMessageParams;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.http.HttpServletRequest;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.IntStream;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -29,9 +35,13 @@ import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.codec.ServerSentEvent;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
@@ -39,35 +49,49 @@ import reactor.core.publisher.Flux;
 
 @RestController
 @Slf4j
+@EnableScheduling
 public class InferenceController {
 
   @Autowired private VectorStore vectorStore;
   @Autowired private ToolCallbackProvider toolCallbackProvider;
   @Autowired private ChatModel chatModel;
-
   @Autowired private ObjectMapper objectMapper;
+
+  @Autowired private ApplicationContext applicationContext;
+
+  @Value("${spring.ai.ollama.chat.model}")
+  private String model;
 
   @Value("${hyperAGI.api}")
   private String hyperAGIAPI;
 
-  private static final String SYSTEM_PROMPT_TEMPLATE =
-      """
-            Below is the system prompt
-            {customSystemPrompt}
-            You are capable of reasoning, retrieving knowledge, and using external tools. Your behavior is governed by the following rules: If the user's query requires real-time data retrieval, calculations, product lookup, price checking, or internet search, you MUST use the provided tools to answer. In this case, completely IGNORE both the knowledge base and conversation history. Respond only based on the current query and tool results. Tool usage should be triggered whenever the user input contains keywords such as: “query,” “check for me,” “search,” “help me search,” “price,” “trend,” “performance,” “growth rate,” or similar terms indicating the need for external data. For all other queries that do not require tools, you should make use of both the knowledge base and the historical conversation context to generate a helpful, accurate response. Never combine tool outputs with knowledge base or context in the same response. At each turn, follow only one rule—either use tools (and ignore all memory), or use knowledge + context (and avoid tools).
-            ---------------------
-            The following content is the knowledge base. If the user's question is addressed here, your response must be derived solely from this content.
-            {context}
-            ---------------------
-            The following is the chat history. Use it only for contextual understanding when the knowledge base does not address the query, and do not let it influence the response if the knowledge base is applicable.
-            {chatHistory}
-            ---------------------
-            {userText}
-            """;
+  // Request counter metrics
+  private final LongAdder requestCounter = new LongAdder();
+  private final AtomicLong pendingRequests = new AtomicLong(0);
+  private final LongAdder totalRequestsLastPeriod = new LongAdder();
 
   @PostMapping(value = "asyncChat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-  public Flux<ServerSentEvent<String>> asyncChat(@RequestBody AiMessageParams messageParams) {
+  public Flux<ServerSentEvent<String>> asyncChat(
+      @RequestBody AiMessageParams messageParams, HttpServletRequest request) {
+
+    if (model.equals("deepseek-r1:32b")) {
+      messageParams.setEnableTool(false);
+      messageParams.setOnlyTool(false);
+    }
+
+    StopWatch watch = new StopWatch();
+
+    watch.start("asyncChat:" + getClientIP(request));
+
+    Instant startTime = Instant.now();
+    requestCounter.increment();
+    pendingRequests.incrementAndGet();
+    totalRequestsLastPeriod.increment();
+
     try {
+      log.info("Request IP: {}", getClientIP(request));
+
+      log.info("Request textContent: {}", messageParams.getTextContent());
 
       List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
 
@@ -84,9 +108,7 @@ public class InferenceController {
             messageParams.getContent() != null ? messageParams.getContent() : "";
 
         String userText = toPrompt(messageParams);
-
         String chatHistory = useChatHistory(sessionId, 30);
-
         String vectorContext =
             useVectorStore(messageParams.getEnableVectorStore(), userId, textContent);
 
@@ -113,25 +135,13 @@ public class InferenceController {
 
       Prompt prompt = new Prompt(messages, chatOptions);
 
-      log.info("Prompt: {}", prompt.getContents());
-
       return ChatClient.create(chatModel).prompt(prompt).stream()
           .chatResponse()
-          .doOnNext(
-              chatResponse -> {
-                log.info("Received ChatResponse: {}", chatResponse);
-                String content =
-                    chatResponse != null
-                            && chatResponse.getResult() != null
-                            && chatResponse.getResult().getOutput() != null
-                        ? chatResponse.getResult().getOutput().getText()
-                        : "";
-              })
+          .doOnNext(chatResponse -> {})
           .collectList()
           .flatMapMany(
               chatResponses -> {
                 try {
-
                   StringBuilder fullContent = new StringBuilder();
                   for (ChatResponse chatResponse : chatResponses) {
                     String content =
@@ -145,7 +155,6 @@ public class InferenceController {
                     }
                   }
                   String finalContent = fullContent.toString();
-                  log.info("Final Content: {}", finalContent);
 
                   if (finalContent.isEmpty()) {
                     return Flux.just(
@@ -224,10 +233,25 @@ public class InferenceController {
                 }
               })
           .doOnError(e -> log.error("ChatClient error: {}", e.getMessage(), e))
-          .doOnComplete(() -> log.info("ChatResponse stream completed"));
+          .doOnComplete(
+              () -> {
+                watch.stop();
+                watch.prettyPrint();
+
+                log.info(watch.prettyPrint(TimeUnit.SECONDS));
+
+                pendingRequests.decrementAndGet();
+              });
 
     } catch (Exception e) {
       log.error("AsyncChat error: {}", e.getMessage(), e);
+
+      pendingRequests.decrementAndGet();
+
+      if (e.getCause() instanceof InterruptedException) {
+        initiateShutdown();
+      }
+
       return Flux.just(
           ServerSentEvent.builder("{\"error\": \"" + e.getMessage() + "\"}")
               .event("error")
@@ -236,8 +260,26 @@ public class InferenceController {
   }
 
   @PostMapping(value = "syncChat", produces = MediaType.APPLICATION_JSON_VALUE)
-  public ResponseEntity<String> syncChat(@RequestBody AiMessageParams messageParams) {
+  public ResponseEntity<String> syncChat(
+      @RequestBody AiMessageParams messageParams, HttpServletRequest request) {
+    Instant startTime = Instant.now();
+    requestCounter.increment();
+    pendingRequests.incrementAndGet();
+    totalRequestsLastPeriod.increment();
+
+    if (model.equals("deepseek-r1:32b")) {
+      messageParams.setEnableTool(false);
+      messageParams.setOnlyTool(false);
+    }
+
     try {
+      log.info("Request IP: {}", getClientIP(request));
+
+      log.info("Request textContent: {}", messageParams.getTextContent());
+
+      StopWatch watch = new StopWatch();
+
+      watch.start("syncChat:" + getClientIP(request));
 
       List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
 
@@ -254,9 +296,7 @@ public class InferenceController {
             messageParams.getContent() != null ? messageParams.getContent() : "";
 
         String userText = toPrompt(messageParams);
-
         String chatHistory = useChatHistory(sessionId, 30);
-
         String vectorContext =
             useVectorStore(messageParams.getEnableVectorStore(), userId, textContent);
 
@@ -283,17 +323,8 @@ public class InferenceController {
 
       Prompt prompt = new Prompt(messages, chatOptions);
 
-      log.info("Prompt: {}", prompt.getContents());
-
       ChatClient chatClient = ChatClient.builder(chatModel).build();
       ChatResponse chatResponse = chatClient.prompt(prompt).call().chatResponse();
-
-      log.info("ChatResponse: {}", chatResponse);
-      log.info(
-          "ChatResponse Content: {}",
-          chatResponse != null && chatResponse.getResult() != null
-              ? chatResponse.getResult().getOutput().getText()
-              : "null");
 
       if (chatResponse.getResult() != null
           && chatResponse.getResult().getOutput().getToolCalls() != null) {
@@ -319,13 +350,37 @@ public class InferenceController {
       response.put("content", responseContent);
       response.put("metadata", metadata);
       String json = objectMapper.writeValueAsString(response);
-      log.info("Response JSON: {}", json);
 
+      watch.stop();
+
+      log.info(watch.prettyPrint(TimeUnit.SECONDS));
+
+      pendingRequests.decrementAndGet();
       return ResponseEntity.ok(json);
     } catch (Exception e) {
+
       log.error("SyncChat error: {}", e.getMessage(), e);
+
+      pendingRequests.decrementAndGet();
+
+      if (e.getCause() instanceof InterruptedException) {
+        initiateShutdown();
+      }
       return ResponseEntity.status(500).body("{\"error\": \"" + e.getMessage() + "\"}");
     }
+  }
+
+  @Scheduled(fixedRate = 60000) // Run every 60 seconds
+  public void logRequestMetrics() {
+    long requestsInPeriod = totalRequestsLastPeriod.sumThenReset();
+    long currentPending = pendingRequests.get();
+    long totalRequests = requestCounter.sum();
+
+    log.info(
+        "Request Metrics: Total Requests = {}, Requests Per Minute = {}, Pending Requests = {}",
+        totalRequests,
+        requestsInPeriod,
+        currentPending);
   }
 
   public String toPrompt(AiMessageParams input) {
@@ -344,13 +399,11 @@ public class InferenceController {
 
     List<Document> documentList = vectorStore.similaritySearch(searchRequest);
     List<String> texts = documentList.stream().map(Document::getText).toList();
-    log.info("useVectorStore: {}", String.join("\n", texts));
 
     return String.join("\n", texts);
   }
 
   public String useChatHistory(String sessionId, Integer pageSize) {
-
     String body =
         HttpRequest.get(hyperAGIAPI + "/mgn/aiMessage/list")
             .form("pageNo", "1")
@@ -362,7 +415,6 @@ public class InferenceController {
             .body();
 
     JSONObject result = new JSONObject(body);
-
     JSONArray records = result.getJSONObject("result").getJSONArray("records");
 
     Collections.reverse(records);
@@ -372,7 +424,6 @@ public class InferenceController {
             .map(
                 record -> {
                   JSONObject i = (JSONObject) record;
-
                   return i.getStr("type") + ":" + i.getStr("textContent");
                 })
             .toList();
@@ -391,7 +442,6 @@ public class InferenceController {
   }
 
   private String getSystemPromptTemplate() {
-
     String body =
         HttpRequest.get(hyperAGIAPI + "/sys/dict/getDictText/sys_config/SYSTEM_PROMPT_TEMPLATE")
             .timeout(10000)
@@ -399,9 +449,51 @@ public class InferenceController {
             .body();
 
     JSONObject result = new JSONObject(body);
-
     String systemPromptTemplate = result.getStr("result");
 
     return systemPromptTemplate;
+  }
+
+  private void initiateShutdown() {
+    log.info("Initiating application shutdown due to InterruptedException");
+    // 使用 Spring 的 ApplicationContext 关闭应用程序
+    ConfigurableApplicationContext context = (ConfigurableApplicationContext) applicationContext;
+    context.close();
+    // 或者直接退出 JVM
+    System.exit(1);
+  }
+
+  public static String getClientIP(HttpServletRequest request) {
+    String ip = request.getHeader("X-Forwarded-For");
+    if (ip != null && !ip.isEmpty() && !"unknown".equalsIgnoreCase(ip)) {
+      // X-Forwarded-For 可能包含多个 IP，第一个是客户端真实 IP
+      int index = ip.indexOf(",");
+      if (index != -1) {
+        return ip.substring(0, index).trim();
+      }
+      return ip;
+    }
+    ip = request.getHeader("X-Real-IP");
+    if (ip != null && !ip.isEmpty() && !"unknown".equalsIgnoreCase(ip)) {
+      return ip;
+    }
+    return request.getRemoteAddr(); // 直接获取 IP，可能为代理服务器 IP
+  }
+
+  public static void main(String[] args) throws InterruptedException {
+
+    StopWatch watch = new StopWatch();
+
+    // 启动计时
+    watch.start("Task 1");
+
+    // 模拟一些耗时操作
+    Thread.sleep(1000); // 暂停1秒
+
+    // 停止计时
+    watch.stop();
+
+    // 打印结果
+    log.info(watch.prettyPrint());
   }
 }

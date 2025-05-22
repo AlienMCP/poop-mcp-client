@@ -21,7 +21,7 @@ spring:
         name: poop-mcp-client
         version: 1.0.0
         request-timeout: 300s
-        type: SYNC  # or ASYNC for reactive applications
+        type: ASYNC  # or ASYNC for reactive applications
         toolcallback:
           enabled: true
         sse:
