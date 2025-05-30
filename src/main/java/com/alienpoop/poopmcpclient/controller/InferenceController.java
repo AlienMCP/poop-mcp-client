@@ -5,6 +5,7 @@ import cn.hutool.http.HttpRequest;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import com.alienpoop.poopmcpclient.dto.AiMessageParams;
+import com.alienpoop.poopmcpclient.service.ToolCallbackService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletRequest;
@@ -58,6 +59,8 @@ public class InferenceController {
   @Autowired private ObjectMapper objectMapper;
 
   @Autowired private ApplicationContext applicationContext;
+
+  @Autowired private ToolCallbackService toolCallbackService;
 
   @Value("${spring.ai.ollama.chat.model}")
   private String model;
@@ -130,7 +133,7 @@ public class InferenceController {
       OllamaOptions chatOptions = OllamaOptions.builder().build();
 
       if (messageParams.getEnableTool() || messageParams.getOnlyTool()) {
-        chatOptions.setToolCallbacks(Arrays.asList(toolCallbackProvider.getToolCallbacks()));
+        chatOptions.setToolCallbacks(toolCallbackService.getFunctionCallbackList());
       }
 
       Prompt prompt = new Prompt(messages, chatOptions);
@@ -318,7 +321,7 @@ public class InferenceController {
       OllamaOptions chatOptions = OllamaOptions.builder().build();
 
       if (messageParams.getEnableTool() || messageParams.getOnlyTool()) {
-        chatOptions.setToolCallbacks(Arrays.asList(toolCallbackProvider.getToolCallbacks()));
+        chatOptions.setToolCallbacks(toolCallbackService.getFunctionCallbackList());
       }
 
       Prompt prompt = new Prompt(messages, chatOptions);
@@ -363,9 +366,6 @@ public class InferenceController {
 
       pendingRequests.decrementAndGet();
 
-      if (e.getCause() instanceof InterruptedException) {
-        initiateShutdown();
-      }
       return ResponseEntity.status(500).body("{\"error\": \"" + e.getMessage() + "\"}");
     }
   }
