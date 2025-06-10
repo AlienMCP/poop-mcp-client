@@ -77,23 +77,30 @@ public class InferenceController {
   public Flux<ServerSentEvent<String>> asyncChat(
       @RequestBody AiMessageParams messageParams, HttpServletRequest request) {
 
+    // 验证输入参数
+    if (messageParams == null) {
+      log.error("AiMessageParams is null");
+      return Flux.just(
+          ServerSentEvent.builder("{\"error\": \"Invalid input: AiMessageParams is null\"}")
+              .event("error")
+              .build());
+    }
+
+    // 禁用 cogito:32b 的工具调用以确保兼容性
     if (model.equals("deepseek-r1:32b")) {
       messageParams.setEnableTool(false);
       messageParams.setOnlyTool(false);
     }
 
     StopWatch watch = new StopWatch();
-
     watch.start("asyncChat:" + getClientIP(request));
 
-    Instant startTime = Instant.now();
     requestCounter.increment();
     pendingRequests.incrementAndGet();
     totalRequestsLastPeriod.increment();
 
     try {
       log.info("Request IP: {}", getClientIP(request));
-
       log.info("Request textContent: {}", messageParams.getTextContent());
 
       List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
@@ -131,136 +138,285 @@ public class InferenceController {
       }
 
       OllamaOptions chatOptions = OllamaOptions.builder().build();
-
       if (messageParams.getEnableTool() || messageParams.getOnlyTool()) {
         chatOptions.setToolCallbacks(toolCallbackService.getFunctionCallbackList());
       }
 
       Prompt prompt = new Prompt(messages, chatOptions);
 
-      return ChatClient.create(chatModel).prompt(prompt).stream()
-          .chatResponse()
-          .doOnNext(chatResponse -> {})
-          .collectList()
-          .flatMapMany(
-              chatResponses -> {
-                try {
-                  StringBuilder fullContent = new StringBuilder();
-                  for (ChatResponse chatResponse : chatResponses) {
-                    String content =
-                        chatResponse != null
-                                && chatResponse.getResult() != null
-                                && chatResponse.getResult().getOutput() != null
-                            ? chatResponse.getResult().getOutput().getText()
-                            : "";
-                    if (!fullContent.toString().endsWith(content)) {
-                      fullContent.append(content);
-                    }
-                  }
-                  String finalContent = fullContent.toString();
+      // 使用同步调用获取完整响应
+      ChatClient chatClient = ChatClient.builder(chatModel).build();
+      ChatResponse chatResponse = chatClient.prompt(prompt).call().chatResponse();
 
-                  if (finalContent.isEmpty()) {
-                    return Flux.just(
-                        ServerSentEvent.builder("{\"error\": \"No content received\"}")
-                            .event("error")
-                            .build());
-                  }
+      // 检查响应是否有效
+      String content =
+          chatResponse != null
+                  && chatResponse.getResult() != null
+                  && chatResponse.getResult().getOutput() != null
+              ? chatResponse.getResult().getOutput().getText()
+              : "";
+      if (content.isEmpty()) {
+        log.warn("Empty chatResponse content");
+        return Flux.just(
+            ServerSentEvent.builder("{\"error\": \"No content received\"}").event("error").build());
+      }
 
-                  Flux<ServerSentEvent<String>> contentFlux =
-                      Flux.fromStream(
-                              finalContent.chars().mapToObj(ch -> String.valueOf((char) ch)))
-                          .map(
-                              charContent -> {
-                                try {
-                                  Map<String, Object> response = new HashMap<>();
-                                  response.put("content", charContent);
-                                  String json = objectMapper.writeValueAsString(response);
-                                  log.debug("Sending content event: {}", json);
-                                  return ServerSentEvent.builder(json).event("message").build();
-                                } catch (JsonProcessingException e) {
-                                  log.error("JSON serialization error: {}", e.getMessage(), e);
-                                  return ServerSentEvent.builder(
-                                          "{\"error\": \"Serialization error\"}")
-                                      .event("error")
-                                      .build();
-                                }
-                              })
-                          .delayElements(Duration.ofMillis(50));
-
-                  ChatResponse lastResponse =
-                      chatResponses.isEmpty() ? null : chatResponses.get(chatResponses.size() - 1);
-                  Object metadata = null;
-                  try {
-                    metadata =
-                        lastResponse != null && lastResponse.getMetadata() != null
-                            ? lastResponse.getMetadata().getUsage()
-                            : null;
-                  } catch (Exception e) {
-                    log.error("Error accessing metadata: {}", e.getMessage(), e);
-                  }
-
-                  Flux<ServerSentEvent<String>> metadataFlux =
-                      Flux.just(metadata)
-                          .map(
-                              meta -> {
-                                try {
-                                  Map<String, Object> metadataResponse = new HashMap<>();
-                                  if (meta != null) {
-                                    metadataResponse.put("metadata", meta);
-                                  } else {
-                                    metadataResponse.put("metadata", "No metadata available");
-                                  }
-                                  String json = objectMapper.writeValueAsString(metadataResponse);
-                                  log.debug("Sending metadata event: {}", json);
-                                  return ServerSentEvent.builder(json).event("metadata").build();
-                                } catch (JsonProcessingException e) {
-                                  log.error(
-                                      "JSON serialization error for metadata: {}",
-                                      e.getMessage(),
-                                      e);
-                                  return ServerSentEvent.builder(
-                                          "{\"error\": \"Metadata serialization error\"}")
-                                      .event("error")
-                                      .build();
-                                }
-                              });
-
-                  return contentFlux.concatWith(metadataFlux);
-                } catch (Exception e) {
-                  log.error("Processing error: {}", e.getMessage(), e);
-                  return Flux.just(
-                      ServerSentEvent.builder(
-                              "{\"error\": \"Processing error: " + e.getMessage() + "\"}")
+      // 模拟流式输出
+      Flux<ServerSentEvent<String>> contentFlux =
+          Flux.fromStream(content.chars().mapToObj(ch -> String.valueOf((char) ch)))
+              .map(
+                  charContent -> {
+                    try {
+                      Map<String, Object> response = new HashMap<>();
+                      response.put("content", charContent);
+                      String json = objectMapper.writeValueAsString(response);
+                      log.debug("Sending content event: {}", json);
+                      return ServerSentEvent.builder(json).event("message").build();
+                    } catch (JsonProcessingException e) {
+                      log.error("JSON serialization error: {}", e.getMessage(), e);
+                      return ServerSentEvent.builder("{\"error\": \"Serialization error\"}")
                           .event("error")
-                          .build());
-                }
-              })
-          .doOnError(e -> log.error("ChatClient error: {}", e.getMessage(), e))
+                          .build();
+                    }
+                  })
+              .delayElements(Duration.ofMillis(50)); // 模拟流式输出的延迟
+
+      // 处理元数据
+      Object metadata =
+          chatResponse.getMetadata() != null ? chatResponse.getMetadata().getUsage() : null;
+      Flux<ServerSentEvent<String>> metadataFlux =
+          Flux.just(metadata)
+              .map(
+                  meta -> {
+                    try {
+                      Map<String, Object> metadataResponse = new HashMap<>();
+                      metadataResponse.put(
+                          "metadata", meta != null ? meta : "No metadata available");
+                      String json = objectMapper.writeValueAsString(metadataResponse);
+                      log.debug("Sending metadata event: {}", json);
+                      return ServerSentEvent.builder(json).event("metadata").build();
+                    } catch (JsonProcessingException e) {
+                      log.error("JSON serialization error for metadata: {}", e.getMessage(), e);
+                      return ServerSentEvent.builder(
+                              "{\"error\": \"Metadata serialization error\"}")
+                          .event("error")
+                          .build();
+                    }
+                  });
+
+      return contentFlux
+          .concatWith(metadataFlux)
           .doOnComplete(
               () -> {
                 watch.stop();
-                watch.prettyPrint();
-
                 log.info(watch.prettyPrint(TimeUnit.SECONDS));
-
                 pendingRequests.decrementAndGet();
               });
 
     } catch (Exception e) {
       log.error("AsyncChat error: {}", e.getMessage(), e);
-
       pendingRequests.decrementAndGet();
-
       if (e.getCause() instanceof InterruptedException) {
         initiateShutdown();
       }
-
       return Flux.just(
           ServerSentEvent.builder("{\"error\": \"" + e.getMessage() + "\"}")
               .event("error")
               .build());
     }
   }
+
+  //  @PostMapping(value = "asyncChat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+  //  public Flux<ServerSentEvent<String>> asyncChat(
+  //      @RequestBody AiMessageParams messageParams, HttpServletRequest request) {
+  //
+  //    if (model.equals("deepseek-r1:32b")) {
+  //      messageParams.setEnableTool(false);
+  //      messageParams.setOnlyTool(false);
+  //    }
+  //
+  //    StopWatch watch = new StopWatch();
+  //
+  //    watch.start("asyncChat:" + getClientIP(request));
+  //
+  //    requestCounter.increment();
+  //    pendingRequests.incrementAndGet();
+  //    totalRequestsLastPeriod.increment();
+  //
+  //    try {
+  //      log.info("Request IP: {}", getClientIP(request));
+  //
+  //      log.info("Request textContent: {}", messageParams.getTextContent());
+  //
+  //      List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
+  //
+  //      if (Boolean.FALSE.equals(messageParams.getOnlyTool())) {
+  //        String sessionId =
+  //            messageParams.getSessionId() != null ? messageParams.getSessionId() :
+  // "default_session";
+  //        String userId =
+  //            messageParams.getAssistantId() != null
+  //                ? messageParams.getAssistantId()
+  //                : "default_user";
+  //        String textContent =
+  //            messageParams.getTextContent() != null ? messageParams.getTextContent() : "";
+  //        String customSystemPrompt =
+  //            messageParams.getContent() != null ? messageParams.getContent() : "";
+  //
+  //        String userText = toPrompt(messageParams);
+  //        String chatHistory = useChatHistory(sessionId, 30);
+  //        String vectorContext =
+  //            useVectorStore(messageParams.getEnableVectorStore(), userId, textContent);
+  //
+  //        SystemPromptTemplate systemPromptTemplate =
+  //            new SystemPromptTemplate(getSystemPromptTemplate());
+  //        Map<String, Object> systemPromptParams = new HashMap<>();
+  //        systemPromptParams.put("context", vectorContext);
+  //        systemPromptParams.put("chatHistory", chatHistory);
+  //        systemPromptParams.put("customSystemPrompt", customSystemPrompt);
+  //        systemPromptParams.put("userText", userText);
+  //        Prompt systemPrompt = systemPromptTemplate.create(systemPromptParams);
+  //
+  //        messages.add(systemPrompt.getInstructions().get(0));
+  //      } else {
+  //        String userText = toPrompt(messageParams);
+  //        messages.add(new org.springframework.ai.chat.messages.UserMessage(userText));
+  //      }
+  //
+  //      OllamaOptions chatOptions = OllamaOptions.builder().build();
+  //
+  //      if (messageParams.getEnableTool() || messageParams.getOnlyTool()) {
+  //        chatOptions.setToolCallbacks(toolCallbackService.getFunctionCallbackList());
+  //      }
+  //
+  //      Prompt prompt = new Prompt(messages, chatOptions);
+  //
+  //      return ChatClient.create(chatModel).prompt(prompt).stream()
+  //          .chatResponse()
+  //          .doOnNext(chatResponse -> {})
+  //          .collectList()
+  //          .flatMapMany(
+  //              chatResponses -> {
+  //                try {
+  //                  StringBuilder fullContent = new StringBuilder();
+  //                  for (ChatResponse chatResponse : chatResponses) {
+  //                    String content =
+  //                        chatResponse != null
+  //                                && chatResponse.getResult() != null
+  //                                && chatResponse.getResult().getOutput() != null
+  //                            ? chatResponse.getResult().getOutput().getText()
+  //                            : "";
+  //                    if (!fullContent.toString().endsWith(content)) {
+  //                      fullContent.append(content);
+  //                    }
+  //                  }
+  //                  String finalContent = fullContent.toString();
+  //
+  //                  if (finalContent.isEmpty()) {
+  //                    return Flux.just(
+  //                        ServerSentEvent.builder("{\"error\": \"No content received\"}")
+  //                            .event("error")
+  //                            .build());
+  //                  }
+  //
+  //                  Flux<ServerSentEvent<String>> contentFlux =
+  //                      Flux.fromStream(
+  //                              finalContent.chars().mapToObj(ch -> String.valueOf((char) ch)))
+  //                          .map(
+  //                              charContent -> {
+  //                                try {
+  //                                  Map<String, Object> response = new HashMap<>();
+  //                                  response.put("content", charContent);
+  //                                  String json = objectMapper.writeValueAsString(response);
+  //                                  log.debug("Sending content event: {}", json);
+  //                                  return ServerSentEvent.builder(json).event("message").build();
+  //                                } catch (JsonProcessingException e) {
+  //                                  log.error("JSON serialization error: {}", e.getMessage(), e);
+  //                                  return ServerSentEvent.builder(
+  //                                          "{\"error\": \"Serialization error\"}")
+  //                                      .event("error")
+  //                                      .build();
+  //                                }
+  //                              })
+  //                          .delayElements(Duration.ofMillis(50));
+  //
+  //                  ChatResponse lastResponse =
+  //                      chatResponses.isEmpty() ? null : chatResponses.get(chatResponses.size() -
+  // 1);
+  //                  Object metadata = null;
+  //                  try {
+  //                    metadata =
+  //                        lastResponse != null && lastResponse.getMetadata() != null
+  //                            ? lastResponse.getMetadata().getUsage()
+  //                            : null;
+  //                  } catch (Exception e) {
+  //                    log.error("Error accessing metadata: {}", e.getMessage(), e);
+  //                  }
+  //
+  //                  Flux<ServerSentEvent<String>> metadataFlux =
+  //                      Flux.just(metadata)
+  //                          .map(
+  //                              meta -> {
+  //                                try {
+  //                                  Map<String, Object> metadataResponse = new HashMap<>();
+  //                                  if (meta != null) {
+  //                                    metadataResponse.put("metadata", meta);
+  //                                  } else {
+  //                                    metadataResponse.put("metadata", "No metadata available");
+  //                                  }
+  //                                  String json =
+  // objectMapper.writeValueAsString(metadataResponse);
+  //                                  log.debug("Sending metadata event: {}", json);
+  //                                  return
+  // ServerSentEvent.builder(json).event("metadata").build();
+  //                                } catch (JsonProcessingException e) {
+  //                                  log.error(
+  //                                      "JSON serialization error for metadata: {}",
+  //                                      e.getMessage(),
+  //                                      e);
+  //                                  return ServerSentEvent.builder(
+  //                                          "{\"error\": \"Metadata serialization error\"}")
+  //                                      .event("error")
+  //                                      .build();
+  //                                }
+  //                              });
+  //
+  //                  return contentFlux.concatWith(metadataFlux);
+  //                } catch (Exception e) {
+  //                  log.error("Processing error: {}", e.getMessage(), e);
+  //                  return Flux.just(
+  //                      ServerSentEvent.builder(
+  //                              "{\"error\": \"Processing error: " + e.getMessage() + "\"}")
+  //                          .event("error")
+  //                          .build());
+  //                }
+  //              })
+  //          .doOnError(e -> log.error("ChatClient error: {}", e.getMessage(), e))
+  //          .doOnComplete(
+  //              () -> {
+  //                watch.stop();
+  //                watch.prettyPrint();
+  //
+  //                log.info(watch.prettyPrint(TimeUnit.SECONDS));
+  //
+  //                pendingRequests.decrementAndGet();
+  //              });
+  //
+  //    } catch (Exception e) {
+  //      log.error("AsyncChat error: {}", e.getMessage(), e);
+  //
+  //      pendingRequests.decrementAndGet();
+  //
+  //      if (e.getCause() instanceof InterruptedException) {
+  //        initiateShutdown();
+  //      }
+  //
+  //      return Flux.just(
+  //          ServerSentEvent.builder("{\"error\": \"" + e.getMessage() + "\"}")
+  //              .event("error")
+  //              .build());
+  //    }
+  //  }
 
   @PostMapping(value = "syncChat", produces = MediaType.APPLICATION_JSON_VALUE)
   public ResponseEntity<String> syncChat(
