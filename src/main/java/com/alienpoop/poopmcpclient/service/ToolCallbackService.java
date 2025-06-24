@@ -4,7 +4,7 @@ import jakarta.annotation.PostConstruct;
 import java.util.Arrays;
 import java.util.List;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.model.function.FunctionCallback;
+import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -20,9 +20,9 @@ public class ToolCallbackService {
 
   @Autowired private ToolCallbackProvider toolCallbackProvider;
 
-  private List<FunctionCallback> functionCallbackList;
+  private List<ToolCallback> functionCallbackList;
 
-  public List<FunctionCallback> getFunctionCallbackList() {
+  public List<ToolCallback> getFunctionCallbackList() {
     if (functionCallbackList == null) {
       functionCallbackList = Arrays.asList(toolCallbackProvider.getToolCallbacks());
     }
@@ -36,7 +36,6 @@ public class ToolCallbackService {
     try {
 
       log.info("Pinging ToolCallbackProvider...");
-
 
       toolCallbackProvider.getToolCallbacks();
     } catch (Exception e) {

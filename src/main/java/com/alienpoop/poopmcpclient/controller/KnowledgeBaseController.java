@@ -59,7 +59,9 @@ public class KnowledgeBaseController {
 
       List<String> deleteIds = documentList.stream().map(Document::getId).toList();
 
-      vectorStore.delete(deleteIds);
+      if (!deleteIds.isEmpty()) {
+        vectorStore.delete(deleteIds);
+      }
 
       List<Document> allSplitDocuments = new ArrayList<>();
 
@@ -92,7 +94,12 @@ public class KnowledgeBaseController {
               "\n",
               allSplitDocuments.stream().map(Document::getText).collect(Collectors.toList())));
 
-      vectorStore.add(allSplitDocuments);
+
+      if(!allSplitDocuments.isEmpty()){
+
+        vectorStore.add(allSplitDocuments);
+      }
+
 
       log.info("Uploaded document for assistantId: {}", request.getAssistantId());
 
@@ -140,7 +147,8 @@ public class KnowledgeBaseController {
       @RequestBody KnowledgeBaseController.QueryRequest request) {
     try {
 
-      SearchRequest.Builder builder = SearchRequest.builder().topK(request.getTopK());
+      SearchRequest.Builder builder =
+          SearchRequest.builder().similarityThreshold(0.5).topK(request.getTopK());
 
       if (StrUtil.isNotBlank(request.getQuery())) {
 

@@ -1,6 +1,7 @@
 package com.alienpoop.poopmcpclient.controller;
 
 import cn.hutool.core.date.StopWatch;
+import cn.hutool.core.util.StrUtil;
 import cn.hutool.http.HttpRequest;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
@@ -551,10 +552,16 @@ public class InferenceController {
     log.info("filterExpression: {}", exp);
 
     SearchRequest searchRequest =
-        SearchRequest.builder().query(userText).filterExpression(exp).build();
+        SearchRequest.builder()
+            .similarityThreshold(0)
+            .query(userText)
+            .filterExpression(exp)
+            .build();
 
     List<Document> documentList = vectorStore.similaritySearch(searchRequest);
     List<String> texts = documentList.stream().map(Document::getText).toList();
+
+    log.info("texts: {}", StrUtil.join(",", texts));
 
     return String.join("\n", texts);
   }

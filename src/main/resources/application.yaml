@@ -1,11 +1,10 @@
 spring:
-  neo4j:
-    uri: ${NEO4J_URI}
+  elasticsearch:
+    uris: ${ES_URI}
   ai:
     vectorstore:
-      neo4j:
+      elasticsearch:
         initialize-schema: true
-        database-name: neo4j
         index-name: custom-index
         dimensions: 1024
         distance-type: cosine
