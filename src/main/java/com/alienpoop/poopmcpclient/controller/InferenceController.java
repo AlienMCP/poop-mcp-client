@@ -509,6 +509,7 @@ public class InferenceController {
       Map<String, Object> response = new HashMap<>();
       response.put("content", responseContent);
       response.put("metadata", metadata);
+      response.put("prompt", prompt.toString());
       String json = objectMapper.writeValueAsString(response);
 
       watch.stop();
